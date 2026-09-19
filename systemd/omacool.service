@@ -1,0 +1,41 @@
+[Unit]
+Description=omacool fan controller
+Documentation=https://github.com/giovesch/omacool
+After=multi-user.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/lib/omacool/omacool daemon
+Restart=on-failure
+RestartSec=2
+
+# The control socket lives here; systemd creates and cleans up the directory.
+RuntimeDirectory=omacool
+RuntimeDirectoryMode=0755
+
+# Writing pwm* needs root, but nothing else does. Everything below narrows what
+# a compromised daemon could reach while leaving /sys/class/hwmon writable.
+ConfigurationDirectory=omacool
+ProtectSystem=strict
+ReadWritePaths=/sys/class/hwmon /sys/devices /etc/omacool
+ProtectHome=yes
+PrivateTmp=yes
+PrivateNetwork=yes
+NoNewPrivileges=yes
+RestrictAddressFamilies=AF_UNIX
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+CapabilityBoundingSet=CAP_DAC_OVERRIDE
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectClock=yes
+ProtectControlGroups=yes
+ProtectHostname=yes
+
+[Install]
+WantedBy=multi-user.target

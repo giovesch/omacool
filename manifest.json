@@ -1,0 +1,22 @@
+{
+  "schemaVersion": 1,
+  "id": "io.github.giovesch.omacool",
+  "name": "omacool",
+  "version": "1.0.0",
+  "author": "Giovanni Schiavo",
+  "license": "MIT",
+  "description": "Fan control for the Omarchy bar: every hwmon fan and temperature sensor, with presets, per-fan modes and a draggable curve editor.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Cooling",
+    "description": "Fan speeds, temperatures, presets and curves",
+    "category": "System",
+    "allowMultiple": false,
+    "defaultSection": "right"
+  }
+}

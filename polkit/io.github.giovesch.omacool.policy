@@ -1,0 +1,33 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE policyconfig PUBLIC
+ "-//freedesktop//DTD PolicyKit Policy Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/PolicyKit/1.0/policyconfig.dtd">
+
+<!--
+  Who may change a fan speed.
+
+  The default grants it to the active local session without a password: the
+  person sitting at the machine can drag a slider, and a background job, a cron
+  task or an SSH login cannot. This is the same trade power-profiles-daemon
+  makes for switching power profiles, and it is why omacool needs no unix group.
+
+  To require a password instead, change allow_active to auth_admin_keep — polkit
+  will then prompt once and remember for a few minutes, through Omarchy's own
+  polkit agent. Nothing in omacool needs to change.
+-->
+<policyconfig>
+  <vendor>omacool</vendor>
+  <vendor_url>https://github.com/giovesch/omacool</vendor_url>
+
+  <action id="io.github.giovesch.omacool.control">
+    <description>Control fan speeds</description>
+    <description xml:lang="it">Controllare la velocità delle ventole</description>
+    <message>Authentication is required to change fan speeds</message>
+    <message xml:lang="it">È richiesta l'autenticazione per cambiare la velocità delle ventole</message>
+    <defaults>
+      <allow_any>no</allow_any>
+      <allow_inactive>no</allow_inactive>
+      <allow_active>yes</allow_active>
+    </defaults>
+  </action>
+</policyconfig>

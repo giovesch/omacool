@@ -1,0 +1,1100 @@
+#!/usr/bin/env python3
+"""omacool — hwmon fan control for Omarchy.
+
+Two halves live in this one file:
+
+  * an unprivileged reader/CLI that enumerates hwmon chips, fans and temperature
+    sensors and prints them as JSON for the Omarchy panel, and
+  * a root daemon (`omacool daemon`) that owns every write to `pwm*`, applies
+    fan curves, and exposes a line-delimited JSON socket so the panel can change
+    modes without prompting for a password on every slider drag.
+
+Reads are always direct from sysfs, so the panel still shows temperatures and
+RPMs when the daemon is not installed. Writes go through the daemon, or are
+applied in-process when the CLI itself runs as root.
+
+Stdlib only. No third-party dependencies.
+"""
+
+from __future__ import annotations
+
+import argparse
+import atexit
+import errno
+import json
+import os
+import re
+import signal
+import socket
+import struct
+import subprocess
+import sys
+import threading
+import time
+
+# Overridable so the test harness can point the whole tool at a fake sysfs tree.
+HWMON_ROOT = os.environ.get("OMACOOL_HWMON", "/sys/class/hwmon")
+CONFIG_PATH = os.environ.get("OMACOOL_CONFIG", "/etc/omacool/config.json")
+SOCKET_PATH = os.environ.get("OMACOOL_SOCKET", "/run/omacool/omacool.sock")
+
+# Authorization is polkit's job, not a unix group's: the socket is open, and
+# every command that changes a fan is checked against this action. The shipped
+# policy grants it to the active local session without a password, the same way
+# power-profiles-daemon lets a desktop switch power profiles.
+POLKIT_ACTION = "io.github.giovesch.omacool.control"
+PKCHECK = os.environ.get("OMACOOL_PKCHECK", "pkcheck")
+
+# Everything here is readable from sysfs without privileges anyway, so asking
+# polkit about it would only add latency.
+READ_ONLY_COMMANDS = frozenset({"ping", "status", "config"})
+
+PWM_MAX = 255
+
+# pwm*_enable semantics vary by driver, but 1 is "software sets pwm*" on every
+# chip lm-sensors supports, and >=2 is some flavour of firmware/automatic.
+ENABLE_MANUAL = 1
+ENABLE_AUTO = 2
+
+MODE_AUTO = "auto"
+MODE_MANUAL = "manual"
+MODE_CURVE = "curve"
+
+DEFAULT_CURVES = {
+    "silent": [[35, 0], [50, 20], [65, 35], [78, 60], [88, 100]],
+    "balanced": [[30, 20], [45, 30], [60, 45], [75, 70], [85, 100]],
+    "performance": [[30, 35], [45, 50], [58, 70], [70, 90], [80, 100]],
+}
+
+DEFAULT_CONFIG = {
+    "version": 1,
+    "preset": "balanced",
+    "interval": 1.0,
+    # Above this temperature every controllable fan is forced to 100% no matter
+    # what the user configured. Curves are a comfort feature; this is not.
+    "critical_temp": 90,
+    # Percent points that must be crossed before a fan is rewritten, so a sensor
+    # wobbling by a degree does not audibly pulse the fan.
+    "hysteresis": 4,
+    # Fans stall below a certain duty cycle and then need a kick to start again.
+    "spinup_percent": 45,
+    "spinup_ms": 900,
+    # The socket is open because polkit, not the filesystem, decides who may
+    # change a fan. Set this to "0600" to lock control down to root alone.
+    "socket_mode": "0666",
+    "presets": {
+        "auto": {"label": "Auto", "mode": MODE_AUTO},
+        "silent": {"label": "Silent", "mode": MODE_CURVE, "curve": DEFAULT_CURVES["silent"]},
+        "balanced": {"label": "Balanced", "mode": MODE_CURVE, "curve": DEFAULT_CURVES["balanced"]},
+        "performance": {"label": "Perf", "mode": MODE_CURVE, "curve": DEFAULT_CURVES["performance"]},
+        "max": {"label": "Max", "mode": MODE_MANUAL, "percent": 100},
+    },
+    # Per-fan overrides, keyed by fan id. Anything absent follows the preset.
+    "fans": {},
+}
+
+
+# --------------------------------------------------------------------------
+# sysfs reading
+# --------------------------------------------------------------------------
+
+def _read(path, default=None):
+    try:
+        with open(path, "r") as handle:
+            return handle.read().strip()
+    except OSError:
+        return default
+
+
+def _read_int(path, default=None):
+    raw = _read(path)
+    if raw is None:
+        return default
+    try:
+        return int(raw)
+    except ValueError:
+        return default
+
+
+def _write_int(path, value):
+    with open(path, "w") as handle:
+        handle.write(str(int(value)))
+
+
+def pwm_to_percent(value):
+    if value is None:
+        return None
+    return int(round(max(0, min(PWM_MAX, value)) * 100.0 / PWM_MAX))
+
+
+def percent_to_pwm(percent):
+    percent = max(0, min(100, int(round(percent))))
+    return int(round(percent * PWM_MAX / 100.0))
+
+
+def _slug(text):
+    return re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-") or "chip"
+
+
+def _chip_label(path, name):
+    """Best-effort human name: the driver name plus whatever bus id we can find.
+
+    hwmon numbering is not stable across boots, so ids are built from the chip
+    name instead, with a numeric suffix only when two chips share one name.
+    """
+    device = os.path.join(path, "device")
+    address = ""
+    if os.path.islink(device):
+        address = os.path.basename(os.path.realpath(device))
+    return name, address
+
+
+def discover():
+    """Enumerate every hwmon chip with its temperature sensors and fans."""
+    chips = []
+    seen_names = {}
+
+    try:
+        entries = sorted(os.listdir(HWMON_ROOT), key=lambda n: (len(n), n))
+    except OSError:
+        return chips
+
+    for entry in entries:
+        path = os.path.join(HWMON_ROOT, entry)
+        name = _read(os.path.join(path, "name")) or entry
+        _, address = _chip_label(path, name)
+
+        slug = _slug(name)
+        seen_names[slug] = seen_names.get(slug, 0) + 1
+        chip_id = slug if seen_names[slug] == 1 else "%s-%d" % (slug, seen_names[slug])
+
+        try:
+            files = set(os.listdir(path))
+        except OSError:
+            continue
+
+        chip = {
+            "id": chip_id,
+            "name": name,
+            "address": address,
+            "path": path,
+            "temps": [],
+            "fans": [],
+        }
+
+        for filename in sorted(files):
+            match = re.fullmatch(r"temp(\d+)_input", filename)
+            if not match:
+                continue
+            index = match.group(1)
+            value = _read_int(os.path.join(path, filename))
+            if value is None:
+                continue
+            label = _read(os.path.join(path, "temp%s_label" % index)) or "temp%s" % index
+            crit = _read_int(os.path.join(path, "temp%s_crit" % index))
+            high = _read_int(os.path.join(path, "temp%s_max" % index))
+            chip["temps"].append({
+                "id": "%s/temp%s" % (chip_id, index),
+                "chip": chip_id,
+                "chipName": name,
+                "label": label,
+                "value": round(value / 1000.0, 1),
+                "crit": round(crit / 1000.0, 1) if crit else None,
+                "high": round(high / 1000.0, 1) if high else None,
+                "path": os.path.join(path, filename),
+            })
+
+        # A fan entry is anything with a tachometer, a pwm channel, or both. The
+        # two are matched by index, which is the convention every hwmon driver
+        # follows (pwm2 drives the fan reported by fan2_input).
+        indices = set()
+        for filename in files:
+            match = re.fullmatch(r"(?:fan(\d+)_input|pwm(\d+))", filename)
+            if match:
+                indices.add(match.group(1) or match.group(2))
+
+        for index in sorted(indices, key=lambda value: int(value)):
+            tacho = os.path.join(path, "fan%s_input" % index)
+            pwm = os.path.join(path, "pwm%s" % index)
+            enable = os.path.join(path, "pwm%s_enable" % index)
+            has_tacho = os.path.exists(tacho)
+            has_pwm = os.path.exists(pwm)
+            if not has_tacho and not has_pwm:
+                continue
+
+            label = (_read(os.path.join(path, "fan%s_label" % index))
+                     or _read(os.path.join(path, "pwm%s_label" % index))
+                     or "fan%s" % index)
+            chip["fans"].append({
+                "id": "%s/fan%s" % (chip_id, index),
+                "chip": chip_id,
+                "chipName": name,
+                "index": int(index),
+                "label": label,
+                "rpm": _read_int(tacho) if has_tacho else None,
+                "percent": pwm_to_percent(_read_int(pwm)) if has_pwm else None,
+                "controllable": has_pwm and os.access(pwm, os.W_OK | os.F_OK),
+                "writable": has_pwm,
+                "enable": _read_int(enable) if os.path.exists(enable) else None,
+                "pwmPath": pwm if has_pwm else None,
+                "enablePath": enable if os.path.exists(enable) else None,
+                "tachoPath": tacho if has_tacho else None,
+                "min": _read_int(os.path.join(path, "fan%s_min" % index)),
+            })
+
+        if chip["temps"] or chip["fans"]:
+            chips.append(chip)
+
+    return chips
+
+
+def flat_temps(chips):
+    return [temp for chip in chips for temp in chip["temps"]]
+
+
+def flat_fans(chips):
+    return [fan for chip in chips for fan in chip["fans"]]
+
+
+def hottest(temps):
+    candidates = [t for t in temps if t["value"] is not None]
+    if not candidates:
+        return None
+    return max(candidates, key=lambda t: t["value"])
+
+
+def resolve_sensor(temps, sensor):
+    """Pick the temperature a fan curve should follow.
+
+    `auto` (the default) tracks the hottest sensor on the machine, which is the
+    behaviour people expect from a single-curve UI — a cool CPU should not keep
+    the case fans idle while the GPU cooks.
+    """
+    if not sensor or sensor == "auto":
+        return hottest(temps)
+    for temp in temps:
+        if temp["id"] == sensor:
+            return temp
+    return hottest(temps)
+
+
+# --------------------------------------------------------------------------
+# curves
+# --------------------------------------------------------------------------
+
+def normalize_curve(points):
+    cleaned = []
+    for point in points or []:
+        try:
+            temp = float(point[0])
+            percent = float(point[1])
+        except (TypeError, ValueError, IndexError):
+            continue
+        cleaned.append([max(0.0, min(120.0, temp)), max(0.0, min(100.0, percent))])
+    cleaned.sort(key=lambda p: p[0])
+
+    # Collapse duplicate temperatures and force the curve to be non-decreasing:
+    # a curve that dips as it gets hotter is always a mistake, and silently
+    # fixing it here keeps the daemon's output monotonic.
+    result = []
+    for temp, percent in cleaned:
+        if result and abs(result[-1][0] - temp) < 0.5:
+            result[-1][1] = max(result[-1][1], percent)
+            continue
+        if result:
+            percent = max(percent, result[-1][1])
+        result.append([temp, percent])
+    return result or [[30.0, 30.0], [80.0, 100.0]]
+
+
+def curve_percent(curve, temperature):
+    points = normalize_curve(curve)
+    if temperature is None:
+        return points[-1][1]
+    if temperature <= points[0][0]:
+        return points[0][1]
+    if temperature >= points[-1][0]:
+        return points[-1][1]
+    for i in range(len(points) - 1):
+        left, right = points[i], points[i + 1]
+        if left[0] <= temperature <= right[0]:
+            span = right[0] - left[0]
+            if span <= 0:
+                return right[1]
+            ratio = (temperature - left[0]) / span
+            return left[1] + ratio * (right[1] - left[1])
+    return points[-1][1]
+
+
+def parse_curve_arg(text):
+    """Parse `40:20,60:50,80:100` into curve points."""
+    points = []
+    for chunk in str(text).split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        if ":" not in chunk:
+            raise ValueError("curve point %r must look like <temp>:<percent>" % chunk)
+        temp, percent = chunk.split(":", 1)
+        points.append([float(temp), float(percent)])
+    if len(points) < 2:
+        raise ValueError("a curve needs at least two points")
+    return normalize_curve(points)
+
+
+# --------------------------------------------------------------------------
+# config
+# --------------------------------------------------------------------------
+
+def load_config(path=CONFIG_PATH):
+    config = json.loads(json.dumps(DEFAULT_CONFIG))
+    raw = _read(path)
+    if raw:
+        try:
+            stored = json.loads(raw)
+        except ValueError:
+            stored = {}
+        if isinstance(stored, dict):
+            presets = config["presets"]
+            presets.update(stored.get("presets") or {})
+            config.update(stored)
+            config["presets"] = presets
+    if not isinstance(config.get("fans"), dict):
+        config["fans"] = {}
+    return config
+
+
+def save_config(config, path=CONFIG_PATH):
+    directory = os.path.dirname(path) or "."
+    os.makedirs(directory, exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w") as handle:
+        json.dump(config, handle, indent=2, sort_keys=True)
+        handle.write("\n")
+    os.replace(tmp, path)
+
+
+def fan_plan(config, fan_id):
+    """Resolve the effective mode/curve/percent for one fan.
+
+    Per-fan settings win; anything they leave out falls back to the active
+    preset, so switching preset still moves fans the user has not pinned.
+    """
+    preset_name = config.get("preset") or "balanced"
+    preset = (config.get("presets") or {}).get(preset_name) or {}
+    override = (config.get("fans") or {}).get(fan_id) or {}
+
+    mode = override.get("mode") or preset.get("mode") or MODE_CURVE
+    plan = {
+        "mode": mode,
+        "source": "fan" if override.get("mode") else "preset",
+        "percent": override.get("percent", preset.get("percent", 50)),
+        "curve": normalize_curve(override.get("curve") or preset.get("curve") or DEFAULT_CURVES["balanced"]),
+        "sensor": override.get("sensor") or preset.get("sensor") or "auto",
+        "min": override.get("min", preset.get("min", 0)),
+    }
+    return plan
+
+
+# --------------------------------------------------------------------------
+# applying
+# --------------------------------------------------------------------------
+
+class Controller:
+    """Owns every write to pwm*. Restores the firmware's settings on exit."""
+
+    def __init__(self, config):
+        self.config = config
+        self.saved_enable = {}
+        self.last_written = {}
+        self.spinup_until = {}
+        self.restored = False
+
+    def refresh(self):
+        self.chips = discover()
+        self.temps = flat_temps(self.chips)
+        self.fans = flat_fans(self.chips)
+        return self.chips
+
+    def _ensure_manual(self, fan):
+        enable_path = fan.get("enablePath")
+        if not enable_path:
+            return
+        current = _read_int(enable_path)
+        if fan["id"] not in self.saved_enable:
+            self.saved_enable[fan["id"]] = (enable_path, current)
+        if current != ENABLE_MANUAL:
+            try:
+                _write_int(enable_path, ENABLE_MANUAL)
+            except OSError as error:
+                log("cannot take manual control of %s: %s" % (fan["id"], error))
+
+    def hand_back(self, fan):
+        """Return a fan to firmware control."""
+        enable_path = fan.get("enablePath")
+        if not enable_path:
+            return
+        saved = self.saved_enable.get(fan["id"])
+        target = saved[1] if saved and saved[1] not in (None, ENABLE_MANUAL) else ENABLE_AUTO
+        try:
+            _write_int(enable_path, target)
+        except OSError as error:
+            log("cannot hand %s back to firmware: %s" % (fan["id"], error))
+        self.last_written.pop(fan["id"], None)
+
+    def write_percent(self, fan, percent, force=False):
+        pwm_path = fan.get("pwmPath")
+        if not pwm_path:
+            return None
+        percent = max(0, min(100, int(round(percent))))
+
+        # A stopped fan will not restart at a low duty cycle on most chips, so
+        # push it past the stall point briefly before settling on the target.
+        now = time.monotonic()
+        last = self.last_written.get(fan["id"])
+        spinup = int(self.config.get("spinup_percent", 45))
+        if percent > 0 and (last in (None, 0) or (fan.get("percent") or 0) == 0) and percent < spinup:
+            self.spinup_until[fan["id"]] = now + int(self.config.get("spinup_ms", 900)) / 1000.0
+        if self.spinup_until.get(fan["id"], 0) > now:
+            percent = max(percent, spinup)
+
+        if not force and last is not None:
+            hysteresis = int(self.config.get("hysteresis", 4))
+            if abs(last - percent) < hysteresis and percent not in (0, 100):
+                return last
+
+        self._ensure_manual(fan)
+        try:
+            _write_int(pwm_path, percent_to_pwm(percent))
+        except OSError as error:
+            log("cannot set %s: %s" % (fan["id"], error))
+            return last
+        self.last_written[fan["id"]] = percent
+        return percent
+
+    def critical_temp(self):
+        configured = self.config.get("critical_temp")
+        try:
+            return float(configured)
+        except (TypeError, ValueError):
+            return 90.0
+
+    def emergency(self):
+        """True when any sensor is at or past the configured critical point."""
+        limit = self.critical_temp()
+        for temp in self.temps:
+            if temp["value"] is not None and temp["value"] >= limit:
+                return temp
+        return None
+
+    def apply_once(self, force=False):
+        self.refresh()
+        alarm = self.emergency()
+
+        for fan in self.fans:
+            if not fan.get("writable"):
+                continue
+            if alarm is not None:
+                self.write_percent(fan, 100, force=True)
+                continue
+
+            plan = fan_plan(self.config, fan["id"])
+            if plan["mode"] == MODE_AUTO:
+                if fan["id"] in self.last_written or force:
+                    self.hand_back(fan)
+                continue
+            if plan["mode"] == MODE_MANUAL:
+                target = plan["percent"]
+            else:
+                sensor = resolve_sensor(self.temps, plan["sensor"])
+                target = curve_percent(plan["curve"], sensor["value"] if sensor else None)
+            target = max(target, plan.get("min") or 0)
+            self.write_percent(fan, target, force=force)
+
+        return alarm
+
+    def restore(self):
+        if self.restored:
+            return
+        self.restored = True
+        for enable_path, value in self.saved_enable.values():
+            try:
+                _write_int(enable_path, value if value is not None else ENABLE_AUTO)
+            except OSError:
+                pass
+
+
+# --------------------------------------------------------------------------
+# status
+# --------------------------------------------------------------------------
+
+def build_status(config=None, daemon_running=None):
+    config = config or load_config()
+    chips = discover()
+    temps = flat_temps(chips)
+    fans = flat_fans(chips)
+    top = hottest(temps)
+
+    for fan in fans:
+        plan = fan_plan(config, fan["id"])
+        fan["mode"] = plan["mode"] if fan["writable"] else "readonly"
+        fan["curve"] = plan["curve"]
+        fan["sensor"] = plan["sensor"]
+        fan["target"] = plan["percent"]
+        fan["pinned"] = fan["id"] in (config.get("fans") or {})
+        for key in ("pwmPath", "enablePath", "tachoPath"):
+            fan.pop(key, None)
+    for temp in temps:
+        temp.pop("path", None)
+
+    if daemon_running is None:
+        daemon_running = daemon_alive()
+
+    presets = []
+    for key, preset in (config.get("presets") or {}).items():
+        presets.append({
+            "id": key,
+            "label": preset.get("label") or key.title(),
+            "mode": preset.get("mode") or MODE_CURVE,
+            "curve": normalize_curve(preset.get("curve")) if preset.get("curve") else None,
+            "percent": preset.get("percent"),
+        })
+    presets.sort(key=lambda p: ["auto", "silent", "balanced", "performance", "max"].index(p["id"])
+                 if p["id"] in ("auto", "silent", "balanced", "performance", "max") else 99)
+
+    return {
+        "ok": True,
+        "daemon": daemon_running,
+        "root": os.geteuid() == 0,
+        "preset": config.get("preset") or "balanced",
+        "criticalTemp": config.get("critical_temp", 90),
+        "hottest": top,
+        "temps": temps,
+        "fans": fans,
+        "presets": presets,
+        "controllable": sum(1 for fan in fans if fan["writable"]),
+    }
+
+
+# --------------------------------------------------------------------------
+# daemon + socket
+# --------------------------------------------------------------------------
+
+def log(message):
+    sys.stderr.write("omacool: %s\n" % message)
+    sys.stderr.flush()
+
+
+def peer_credentials(connection):
+    """(pid, uid, gid) of whoever is on the other end of a unix socket."""
+    raw = connection.getsockopt(socket.SOL_SOCKET, socket.SO_PEERCRED,
+                                struct.calcsize("3i"))
+    return struct.unpack("3i", raw)
+
+
+def process_start_time(pid):
+    """Field 22 of /proc/<pid>/stat.
+
+    polkit wants it alongside the pid so the check is pinned to this exact
+    process: without it, a pid recycled between connecting and being checked
+    would be authorized in place of the caller. `comm` can contain spaces and
+    parentheses, so the fields are read after the last ')'.
+    """
+    try:
+        with open("/proc/%d/stat" % int(pid)) as handle:
+            data = handle.read()
+        fields = data[data.rindex(")") + 2:].split()
+        return int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def authorize(pid, uid, action=POLKIT_ACTION):
+    """Ask polkit whether this caller may change a fan.
+
+    Returns (allowed, reason). The user the daemon itself runs as is always
+    allowed — in production that is root, which can write pwm* directly and has
+    nothing to gain from being asked.
+
+    `--allow-user-interaction` means an administrator can tighten the shipped
+    policy to auth_admin_keep and get a password prompt, through Omarchy's own
+    polkit agent, without a line of this changing.
+    """
+    if uid == os.geteuid():
+        return True, ""
+
+    start = process_start_time(pid)
+    if start is None:
+        return False, "the calling process disappeared before it could be authorized"
+
+    try:
+        result = subprocess.run(
+            [PKCHECK, "--action-id", action,
+             "--process", "%d,%d,%d" % (pid, start, uid),
+             "--allow-user-interaction"],
+            capture_output=True, timeout=120)
+    except FileNotFoundError:
+        return False, "polkit is not installed, so only root can control fans"
+    except subprocess.TimeoutExpired:
+        return False, "polkit authorization timed out"
+    except OSError as error:
+        return False, "could not run %s: %s" % (PKCHECK, error)
+
+    if result.returncode == 0:
+        return True, ""
+    return False, "not authorized by polkit for %s" % action
+
+
+def daemon_alive():
+    if not os.path.exists(SOCKET_PATH):
+        return False
+    try:
+        client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        client.settimeout(1.0)
+        client.connect(SOCKET_PATH)
+        client.close()
+        return True
+    except OSError:
+        return False
+
+
+def send_command(payload, timeout=5.0):
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(timeout)
+    client.connect(SOCKET_PATH)
+    try:
+        client.sendall((json.dumps(payload) + "\n").encode("utf-8"))
+        client.shutdown(socket.SHUT_WR)
+        buffer = b""
+        while True:
+            chunk = client.recv(65536)
+            if not chunk:
+                break
+            buffer += chunk
+    finally:
+        client.close()
+    if not buffer.strip():
+        return {"ok": True}
+    return json.loads(buffer.decode("utf-8").strip().splitlines()[0])
+
+
+class Daemon:
+    def __init__(self, config_path=CONFIG_PATH, socket_path=SOCKET_PATH):
+        self.config_path = config_path
+        self.socket_path = socket_path
+        self.config = load_config(config_path)
+        self.controller = Controller(self.config)
+        self.lock = threading.Lock()
+        self.running = True
+        self.server = None
+        self.last_alarm = None
+
+    # -- config mutations, all under the lock ------------------------------
+
+    def _persist(self):
+        try:
+            save_config(self.config, self.config_path)
+        except OSError as error:
+            log("cannot save config: %s" % error)
+
+    def set_preset(self, name):
+        if name not in (self.config.get("presets") or {}):
+            return {"ok": False, "error": "unknown preset: %s" % name}
+        self.config["preset"] = name
+        # An explicit preset choice is a global one; per-fan pins would silently
+        # override it, so switching preset clears them.
+        self.config["fans"] = {}
+        self._persist()
+        self.controller.apply_once(force=True)
+        return {"ok": True, "preset": name}
+
+    def set_fan(self, fan_id, percent):
+        fans = self.config.setdefault("fans", {})
+        entry = fans.setdefault(fan_id, {})
+        entry["mode"] = MODE_MANUAL
+        entry["percent"] = max(0, min(100, int(round(float(percent)))))
+        self._persist()
+        self.controller.apply_once(force=True)
+        return {"ok": True, "fan": fan_id, "percent": entry["percent"]}
+
+    def set_mode(self, fan_id, mode):
+        if mode not in (MODE_AUTO, MODE_MANUAL, MODE_CURVE):
+            return {"ok": False, "error": "unknown mode: %s" % mode}
+        fans = self.config.setdefault("fans", {})
+        entry = fans.setdefault(fan_id, {})
+        entry["mode"] = mode
+        if mode == MODE_CURVE and not entry.get("curve"):
+            entry["curve"] = fan_plan(self.config, fan_id)["curve"]
+        self._persist()
+        self.controller.apply_once(force=True)
+        return {"ok": True, "fan": fan_id, "mode": mode}
+
+    def set_curve(self, fan_id, curve, sensor=None):
+        points = normalize_curve(curve)
+        fans = self.config.setdefault("fans", {})
+        entry = fans.setdefault(fan_id, {})
+        entry["mode"] = MODE_CURVE
+        entry["curve"] = points
+        if sensor:
+            entry["sensor"] = sensor
+        self._persist()
+        self.controller.apply_once(force=True)
+        return {"ok": True, "fan": fan_id, "curve": points}
+
+    def set_preset_curve(self, preset_name, curve):
+        presets = self.config.setdefault("presets", {})
+        if preset_name not in presets:
+            return {"ok": False, "error": "unknown preset: %s" % preset_name}
+        presets[preset_name]["curve"] = normalize_curve(curve)
+        presets[preset_name]["mode"] = MODE_CURVE
+        self._persist()
+        self.controller.apply_once(force=True)
+        return {"ok": True, "preset": preset_name, "curve": presets[preset_name]["curve"]}
+
+    def reset_fan(self, fan_id):
+        (self.config.get("fans") or {}).pop(fan_id, None)
+        self._persist()
+        self.controller.apply_once(force=True)
+        return {"ok": True, "fan": fan_id}
+
+    # -- request dispatch ---------------------------------------------------
+
+    def dispatch(self, request, connection):
+        """Authorize a request, then run it.
+
+        The polkit check deliberately happens outside `self.lock`: if the policy
+        is ever tightened to prompt for a password, the control loop must keep
+        running fans while the dialog is on screen.
+        """
+        command = str(request.get("cmd") or "")
+        if command not in READ_ONLY_COMMANDS:
+            try:
+                pid, uid, _gid = peer_credentials(connection)
+            except OSError as error:
+                return {"ok": False, "error": "cannot identify caller: %s" % error}
+            allowed, reason = authorize(pid, uid)
+            if not allowed:
+                return {"ok": False, "error": reason}
+        return self.handle(request)
+
+    def handle(self, request):
+        command = str(request.get("cmd") or "")
+        with self.lock:
+            if command == "ping":
+                return {"ok": True, "pong": True}
+            if command == "status":
+                status = build_status(self.config, daemon_running=True)
+                status["alarm"] = self.last_alarm
+                return status
+            if command == "config":
+                return {"ok": True, "config": self.config}
+            if command == "preset":
+                return self.set_preset(str(request.get("name") or ""))
+            if command == "set":
+                return self.set_fan(str(request.get("fan") or ""), request.get("percent"))
+            if command == "mode":
+                return self.set_mode(str(request.get("fan") or ""), str(request.get("mode") or ""))
+            if command == "curve":
+                return self.set_curve(str(request.get("fan") or ""),
+                                      request.get("curve") or [],
+                                      request.get("sensor"))
+            if command == "preset-curve":
+                return self.set_preset_curve(str(request.get("name") or ""), request.get("curve") or [])
+            if command == "reset":
+                return self.reset_fan(str(request.get("fan") or ""))
+            if command == "reload":
+                self.config = load_config(self.config_path)
+                self.controller.config = self.config
+                self.controller.apply_once(force=True)
+                return {"ok": True}
+        return {"ok": False, "error": "unknown command: %s" % command}
+
+    # -- plumbing -----------------------------------------------------------
+
+    def _bind(self):
+        directory = os.path.dirname(self.socket_path) or "/run"
+        os.makedirs(directory, exist_ok=True)
+        if os.path.exists(self.socket_path):
+            os.unlink(self.socket_path)
+        self.server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        self.server.bind(self.socket_path)
+        self.server.listen(8)
+
+        # Connecting is open; authorization happens per command, in polkit. This
+        # mirrors the D-Bus system bus, and keeps the filesystem from encoding a
+        # policy that belongs somewhere an administrator can actually edit.
+        mode = self.config.get("socket_mode", "0666")
+        try:
+            os.chmod(self.socket_path, int(str(mode), 8))
+        except (OSError, ValueError):
+            log("invalid socket_mode %r; falling back to 0666" % (mode,))
+            os.chmod(self.socket_path, 0o666)
+
+    def _serve(self):
+        while self.running:
+            try:
+                connection, _ = self.server.accept()
+            except OSError as error:
+                if error.errno == errno.EINVAL or not self.running:
+                    return
+                continue
+            threading.Thread(target=self._serve_one, args=(connection,), daemon=True).start()
+
+    def _serve_one(self, connection):
+        try:
+            connection.settimeout(5.0)
+            buffer = b""
+            while b"\n" not in buffer:
+                chunk = connection.recv(65536)
+                if not chunk:
+                    break
+                buffer += chunk
+            line = buffer.split(b"\n", 1)[0].decode("utf-8", "replace").strip()
+            if not line:
+                response = {"ok": True}
+            else:
+                try:
+                    response = self.dispatch(json.loads(line), connection)
+                except ValueError:
+                    response = {"ok": False, "error": "malformed request"}
+                except Exception as error:  # a bad request must not kill the daemon
+                    response = {"ok": False, "error": str(error)}
+            connection.sendall((json.dumps(response) + "\n").encode("utf-8"))
+        except OSError:
+            pass
+        finally:
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+    def stop(self, *_args):
+        self.running = False
+        try:
+            if self.server:
+                self.server.close()
+        except OSError:
+            pass
+        try:
+            if os.path.exists(self.socket_path):
+                os.unlink(self.socket_path)
+        except OSError:
+            pass
+        self.controller.restore()
+
+    def run(self):
+        # Writing pwm* on the real sysfs needs root. Against a fake tree (tests)
+        # the ordinary file permissions are the only gate that matters.
+        if os.geteuid() != 0 and HWMON_ROOT == "/sys/class/hwmon":
+            log("the daemon needs root to write pwm* — start it with systemd")
+            return 1
+
+        self._bind()
+        atexit.register(self.controller.restore)
+        # Only the main thread may install handlers; tests drive run() from a
+        # worker thread and stop the daemon explicitly instead.
+        if threading.current_thread() is threading.main_thread():
+            signal.signal(signal.SIGTERM, self.stop)
+            signal.signal(signal.SIGINT, self.stop)
+
+        threading.Thread(target=self._serve, daemon=True).start()
+        log("listening on %s, config %s" % (self.socket_path, self.config_path))
+
+        interval = float(self.config.get("interval", 1.0) or 1.0)
+        while self.running:
+            with self.lock:
+                try:
+                    alarm = self.controller.apply_once()
+                except Exception as error:  # never let a transient sysfs error stop cooling
+                    log("apply failed: %s" % error)
+                    alarm = None
+                if alarm and not self.last_alarm:
+                    log("critical temperature on %s (%.1f°C) — forcing 100%%"
+                        % (alarm["label"], alarm["value"]))
+                self.last_alarm = alarm
+            time.sleep(interval)
+
+        self.stop()
+        return 0
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def control(payload):
+    """Send a control command to the daemon, or apply it directly when root."""
+    try:
+        return send_command(payload)
+    except (OSError, ValueError) as error:
+        if os.geteuid() != 0:
+            return {
+                "ok": False,
+                "error": "omacool daemon is not reachable (%s). Start it with: "
+                         "sudo systemctl enable --now omacool" % error,
+            }
+    # Root fallback: run the same handlers against a throwaway daemon object so
+    # `sudo omacool set ...` works on a machine without the service installed.
+    offline = Daemon()
+    return offline.handle(payload)
+
+
+def print_json(value, pretty=True):
+    json.dump(value, sys.stdout, indent=2 if pretty else None, sort_keys=True)
+    sys.stdout.write("\n")
+
+
+def cmd_status(args):
+    status = build_status()
+    if args.json:
+        print_json(status, pretty=not args.compact)
+        return 0
+
+    print("preset: %s   daemon: %s" % (status["preset"], "running" if status["daemon"] else "stopped"))
+    top = status["hottest"]
+    if top:
+        print("hottest: %s %.1f°C (%s)" % (top["label"], top["value"], top["chipName"]))
+    print()
+    print("TEMPERATURES")
+    for temp in status["temps"]:
+        print("  %-28s %6.1f°C  %s" % (temp["id"], temp["value"], temp["label"]))
+    print()
+    print("FANS")
+    for fan in status["fans"]:
+        rpm = "%5d rpm" % fan["rpm"] if fan["rpm"] is not None else "   no tacho"
+        percent = "%3d%%" % fan["percent"] if fan["percent"] is not None else "  --"
+        flag = "" if fan["writable"] else "  (read-only)"
+        print("  %-28s %s  %s  %-7s %s%s" % (fan["id"], rpm, percent, fan["mode"], fan["label"], flag))
+    return 0
+
+
+def cmd_list(args):
+    chips = discover()
+    if args.json:
+        print_json(chips, pretty=not args.compact)
+        return 0
+    for chip in chips:
+        print("%s  (%s%s)" % (chip["id"], chip["name"], " @ " + chip["address"] if chip["address"] else ""))
+        for temp in chip["temps"]:
+            print("    temp %-24s %s" % (temp["id"], temp["label"]))
+        for fan in chip["fans"]:
+            print("    fan  %-24s %s%s" % (fan["id"], fan["label"],
+                                           "" if fan["writable"] else "  (read-only)"))
+    return 0
+
+
+def cmd_set(args):
+    result = control({"cmd": "set", "fan": args.fan, "percent": args.percent})
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_mode(args):
+    result = control({"cmd": "mode", "fan": args.fan, "mode": args.mode})
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_preset(args):
+    if args.name is None:
+        config = load_config()
+        for key, preset in (config.get("presets") or {}).items():
+            marker = "*" if key == config.get("preset") else " "
+            print("%s %-12s %s" % (marker, key, preset.get("label") or ""))
+        return 0
+    result = control({"cmd": "preset", "name": args.name})
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_curve(args):
+    if args.show:
+        config = load_config()
+        plan = fan_plan(config, args.fan)
+        print_json({"fan": args.fan, "curve": plan["curve"], "sensor": plan["sensor"]})
+        return 0
+    try:
+        points = parse_curve_arg(args.points)
+    except ValueError as error:
+        sys.stderr.write("omacool: %s\n" % error)
+        return 2
+    result = control({"cmd": "curve", "fan": args.fan, "curve": points, "sensor": args.sensor})
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_reset(args):
+    result = control({"cmd": "reset", "fan": args.fan})
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_daemon(args):
+    return Daemon(config_path=args.config, socket_path=args.socket).run()
+
+
+def build_parser():
+    parser = argparse.ArgumentParser(prog="omacool", description="hwmon fan control for Omarchy")
+    parser.add_argument("--version", action="version", version="omacool 1.0.0")
+    sub = parser.add_subparsers(dest="command")
+
+    status = sub.add_parser("status", help="temperatures, fan speeds and the active preset")
+    status.add_argument("--json", action="store_true")
+    status.add_argument("--compact", action="store_true", help="single-line JSON")
+    status.set_defaults(func=cmd_status)
+
+    listing = sub.add_parser("list", help="enumerate hwmon chips, sensors and fans")
+    listing.add_argument("--json", action="store_true")
+    listing.add_argument("--compact", action="store_true")
+    listing.set_defaults(func=cmd_list)
+
+    setter = sub.add_parser("set", help="pin one fan to a fixed duty cycle")
+    setter.add_argument("fan")
+    setter.add_argument("percent", type=float)
+    setter.set_defaults(func=cmd_set)
+
+    mode = sub.add_parser("mode", help="switch one fan between auto, manual and curve")
+    mode.add_argument("fan")
+    mode.add_argument("mode", choices=[MODE_AUTO, MODE_MANUAL, MODE_CURVE])
+    mode.set_defaults(func=cmd_mode)
+
+    preset = sub.add_parser("preset", help="list presets, or apply one to every fan")
+    preset.add_argument("name", nargs="?")
+    preset.set_defaults(func=cmd_preset)
+
+    curve = sub.add_parser("curve", help="read or write one fan's curve")
+    curve.add_argument("fan")
+    curve.add_argument("points", nargs="?", help="e.g. 40:20,60:50,80:100")
+    curve.add_argument("--sensor", help="temperature sensor id, or 'auto' for the hottest")
+    curve.add_argument("--show", action="store_true")
+    curve.set_defaults(func=cmd_curve)
+
+    reset = sub.add_parser("reset", help="drop a fan's override and follow the preset again")
+    reset.add_argument("fan")
+    reset.set_defaults(func=cmd_reset)
+
+    daemon = sub.add_parser("daemon", help="run the control loop (root, normally via systemd)")
+    daemon.add_argument("--config", default=CONFIG_PATH)
+    daemon.add_argument("--socket", default=SOCKET_PATH)
+    daemon.set_defaults(func=cmd_daemon)
+
+    return parser
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if not getattr(args, "func", None):
+        parser.print_help()
+        return 0
+    if getattr(args, "command", None) == "curve" and not args.show and not args.points:
+        args.show = True
+    return args.func(args)
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        sys.exit(130)
+    except BrokenPipeError:
+        sys.exit(0)
