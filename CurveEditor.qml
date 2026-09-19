@@ -182,9 +182,9 @@ Item {
       ctx.clearRect(0, 0, width, height)
 
       var fg = root.foreground
-      var line = Qt.rgba(fg.r, fg.g, fg.b, 0.16)
-      var strong = Qt.rgba(fg.r, fg.g, fg.b, 0.9)
-      var fill = Qt.rgba(fg.r, fg.g, fg.b, 0.10)
+      var line = Qt.rgba(fg.r, fg.g, fg.b, 0.11)
+      var strong = Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.96)
+      var fill = Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.13)
 
       // --- grid -------------------------------------------------------
       ctx.lineWidth = 1
@@ -236,7 +236,7 @@ Item {
         ctx.beginPath()
         ctx.setLineDash([Style.space(3), Style.space(3)])
         ctx.lineWidth = 1
-        ctx.strokeStyle = Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.55)
+        ctx.strokeStyle = Qt.rgba(fg.r, fg.g, fg.b, 0.46)
         ctx.moveTo(markerX, root.padTop)
         ctx.lineTo(markerX, root.padTop + root.plotHeight)
         ctx.stroke()
@@ -245,7 +245,7 @@ Item {
         if (isFinite(root.currentPercent)) {
           ctx.beginPath()
           ctx.arc(markerX, root.plotY(root.currentPercent), Math.max(3, Style.space(4)), 0, Math.PI * 2)
-          ctx.fillStyle = root.accent
+          ctx.fillStyle = fg
           ctx.fill()
         }
       }
@@ -258,13 +258,13 @@ Item {
         var isSelected = k === root.selectedIndex
         ctx.beginPath()
         ctx.arc(hx, hy, isSelected ? handle + Style.space(2) : handle, 0, Math.PI * 2)
-        ctx.fillStyle = isSelected ? root.accent : strong
+        ctx.fillStyle = isSelected ? fg : strong
         ctx.fill()
         if (isSelected) {
           ctx.beginPath()
           ctx.arc(hx, hy, handle + Style.space(4), 0, Math.PI * 2)
           ctx.lineWidth = 1
-          ctx.strokeStyle = Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.6)
+          ctx.strokeStyle = Qt.rgba(root.accent.r, root.accent.g, root.accent.b, 0.85)
           ctx.stroke()
         }
       }
@@ -277,7 +277,7 @@ Item {
     Text {
       required property var modelData
       text: modelData + "%"
-      color: Qt.darker(root.foreground, 1.5)
+      color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.52)
       font.family: root.bar ? root.bar.fontFamily : Style.font.family
       font.pixelSize: Style.font.caption
       x: Style.space(2)
@@ -290,7 +290,7 @@ Item {
     Text {
       required property var modelData
       text: modelData + "°"
-      color: Qt.darker(root.foreground, 1.5)
+      color: Qt.rgba(root.foreground.r, root.foreground.g, root.foreground.b, 0.52)
       font.family: root.bar ? root.bar.fontFamily : Style.font.family
       font.pixelSize: Style.font.caption
       x: Math.min(root.width - implicitWidth, Math.max(0, root.plotX(modelData) - implicitWidth / 2))

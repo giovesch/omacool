@@ -49,6 +49,38 @@ Panel {
   readonly property bool alarming: isFinite(hottestValue) && hottestValue >= criticalTemp
   readonly property int controllableCount: status ? Number(status.controllable || 0) : 0
 
+  // A deliberately small visual vocabulary for the panel.  The shell owns the
+  // actual palette; omacool only derives translucent surfaces from it so the
+  // redesign remains native in light, dark, and user-defined themes.
+  readonly property color ink: bar ? bar.foreground : Color.foreground
+  readonly property color accent: Color.accent
+  readonly property color danger: bar ? bar.urgent : "#ef4444"
+  readonly property color mutedInk: Qt.rgba(ink.r, ink.g, ink.b, 0.58)
+  readonly property color faintInk: Qt.rgba(ink.r, ink.g, ink.b, 0.34)
+  readonly property color softSurface: Qt.rgba(ink.r, ink.g, ink.b, 0.055)
+  readonly property color strongSurface: Qt.rgba(ink.r, ink.g, ink.b, 0.095)
+  readonly property color accentSurface: Qt.rgba(accent.r, accent.g, accent.b, 0.14)
+
+  function presetIcon(id) {
+    if (id === "auto") return "󰒓"
+    if (id === "silent") return "󰖁"
+    if (id === "balanced") return "󰾅"
+    if (id === "performance") return "󰓅"
+    if (id === "max") return "󰈸"
+    return "󰈐"
+  }
+
+  function presetBlurb(preset) {
+    if (!preset) return ""
+    if (preset.id === "auto") return "Firmware managed"
+    if (preset.id === "silent") return "Quiet, low airflow"
+    if (preset.id === "balanced") return "Everyday cooling"
+    if (preset.id === "performance") return "Cool under load"
+    if (preset.id === "max") return "Full speed"
+    if (preset.mode === "manual") return "Fixed at " + preset.percent + "%"
+    return preset.mode === "curve" ? "Temperature curve" : "Custom profile"
+  }
+
   // Duty cycles the user is dragging right now, keyed by fan id. The daemon is
   // only told when the drag ends, so the slider stays smooth and the sysfs
   // round-trip does not yank the knob back mid-gesture.
@@ -216,16 +248,7 @@ Panel {
   }
 
   function ensureCursorVisible(item) {
-    if (!item || !scrollArea) return
-    var flick = scrollArea.contentItem
-    if (!flick || flick.contentY === undefined) return
-    var point = item.mapToItem(flick.contentItem || flick, 0, 0)
-    var top = point.y
-    var bottom = top + (item.height || 0)
-    var margin = Style.space(6)
-    if (top < flick.contentY + margin) flick.contentY = Math.max(0, top - margin)
-    else if (bottom > flick.contentY + flick.height - margin)
-      flick.contentY = bottom + margin - flick.height
+    if (dashboard) dashboard.ensureVisible(item)
   }
 
   // ------------------------------------------------------------- commands
@@ -493,7 +516,7 @@ Panel {
     open: root.opened
     focusTarget: keyCatcher
     contentWidth: panel.fittedContentWidth(Style.space(420))
-    contentHeight: panel.fittedContentHeight(panelColumn.implicitHeight, Style.space(620))
+    contentHeight: panel.fittedContentHeight(dashboard.contentHeight, Style.space(680))
 
     PanelKeyCatcher {
       id: keyCatcher
@@ -508,10 +531,23 @@ Panel {
       onTabRequested: function (direction) { root.switchPanel(direction) }
       onTextKey: function (text) { root.handleTextKey(text) }
 
-      ScrollView {
-        id: scrollArea
+      CoolingDashboard {
+        id: dashboard
         anchors.fill: parent
-        clip: true
+        controller: root
+        bar: root.bar
+      }
+
+      // Kept uninstantiated as a short-lived migration reference. The live
+      // panel above is entirely CoolingDashboard, so this tree has no runtime
+      // cost and can be removed once the redesign has settled.
+      Component {
+        id: legacyDashboard
+
+        ScrollView {
+          id: scrollArea
+          anchors.fill: parent
+          clip: true
         ScrollBar.horizontal.policy: ScrollBar.AlwaysOff
         ScrollBar.vertical.policy: panelColumn.implicitHeight > height ? ScrollBar.AsNeeded : ScrollBar.AlwaysOff
         Binding {
@@ -992,6 +1028,7 @@ Panel {
           Item {
             width: parent.width
             height: Style.space(4)
+          }
           }
         }
       }
