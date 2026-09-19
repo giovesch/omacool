@@ -114,7 +114,7 @@ slows down as the machine heats up is never what you meant.
 
 By default a curve follows the hottest sensor on the machine, which is usually
 what you want: a cool CPU should not keep the case fans idle while the GPU
-cooks. Pick a specific sensor from the dropdown under the curve if you'd rather
+cooks. Pick a specific sensor from the selector under the curve if you'd rather
 pin it.
 
 ## Command line

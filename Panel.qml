@@ -498,6 +498,11 @@ Panel {
           property: "interactive"
           value: panelColumn.implicitHeight > scrollArea.height
         }
+        Binding {
+          target: scrollArea.contentItem
+          property: "boundsBehavior"
+          value: Flickable.StopAtBounds
+        }
 
         Column {
           id: panelColumn
@@ -820,6 +825,9 @@ Panel {
     required property var fan
     required property int rowIndex
 
+    property bool sensorPickerOpen: false
+    onExpandedChanged: if (!expanded) sensorPickerOpen = false
+
     readonly property bool expanded: root.expandedFan === fanRow.fan.id
     readonly property bool controllable: fanRow.fan.writable === true
 
@@ -1078,16 +1086,163 @@ Panel {
           }
         }
 
-        Dropdown {
+        // Inline Sensor Selector: fixes double scroll & popup clipping completely
+        Column {
+          id: sensorSection
           width: parent.width
-          label: "SENSOR"
-          showLabel: true
-          fontFamily: root.bar.fontFamily
-          foreground: root.bar.foreground
-          value: fanRow.fan.sensor || "auto"
-          options: Model.sensorOptions(root.temps)
-          onChanged: function (value) {
-            root.setFanCurve(fanRow.fan.id, fanRow.fan.curve || [], value)
+          spacing: Style.space(6)
+
+          Item {
+            width: parent.width
+            implicitHeight: Math.max(sensorHeader.implicitHeight, sensorToggle.implicitHeight)
+
+            PanelSectionHeader {
+              id: sensorHeader
+              text: "SENSOR"
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              anchors.left: parent.left
+              anchors.verticalCenter: parent.verticalCenter
+            }
+
+            CursorSurface {
+              id: sensorToggle
+              anchors.right: parent.right
+              anchors.verticalCenter: parent.verticalCenter
+              implicitHeight: sensorToggleInner.implicitHeight + Style.spacing.sm
+              implicitWidth: sensorToggleInner.implicitWidth + Style.spacing.md
+              foreground: root.bar.foreground
+              fill: Style.hoverFillFor(root.bar.foreground, Color.accent)
+              bordered: true
+              cursorShape: Qt.PointingHandCursor
+
+              Row {
+                id: sensorToggleInner
+                anchors.centerIn: parent
+                spacing: Style.space(6)
+
+                Text {
+                  textFormat: Text.PlainText
+                  text: {
+                    var s = fanRow.fan.sensor || "auto"
+                    if (s === "auto") {
+                      var hTemp = root.hottest ? Model.formatTemp(root.hottest.value) : "--"
+                      return "🔥 Hottest (" + hTemp + ")"
+                    }
+                    var found = Model.findTemp(root.temps, s)
+                    return found ? (found.label + " (" + Model.formatTemp(found.value) + ")") : s
+                  }
+                  color: root.bar.foreground
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.bold: true
+                }
+
+                Text {
+                  text: fanRow.sensorPickerOpen ? "󰅃" : "󰅀"
+                  color: Qt.darker(root.bar.foreground, 1.3)
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.caption
+                }
+              }
+
+              MouseArea {
+                anchors.fill: parent
+                hoverEnabled: true
+                cursorShape: Qt.PointingHandCursor
+                onClicked: fanRow.sensorPickerOpen = !fanRow.sensorPickerOpen
+              }
+            }
+          }
+
+          // Expandable Sensor Options List (inline - no popup, no nested scrollbar)
+          Column {
+            width: parent.width
+            visible: fanRow.sensorPickerOpen
+            spacing: Style.space(3)
+
+            Repeater {
+              model: Model.sensorOptions(root.temps)
+
+              CursorSurface {
+                id: sensorOptionItem
+                required property var modelData
+                required property int index
+
+                readonly property bool isSelected: (fanRow.fan.sensor || "auto") === modelData.value
+                readonly property var tempObj: modelData.value === "auto" ? root.hottest : Model.findTemp(root.temps, modelData.value)
+
+                width: parent.width
+                implicitHeight: sensorOptInner.implicitHeight + Style.spacing.md
+                foreground: root.bar.foreground
+                fill: isSelected
+                  ? Style.selectedFillFor(root.bar.foreground, Color.accent)
+                  : Style.hoverFillFor(root.bar.foreground, Color.accent)
+                current: isSelected
+                bordered: true
+                cursorShape: Qt.PointingHandCursor
+
+                Item {
+                  id: sensorOptInner
+                  anchors.left: parent.left
+                  anchors.right: parent.right
+                  anchors.leftMargin: Style.space(8)
+                  anchors.rightMargin: Style.space(8)
+                  anchors.verticalCenter: parent.verticalCenter
+                  implicitHeight: Math.max(sensorOptName.implicitHeight, sensorOptVal.implicitHeight)
+
+                  Row {
+                    id: sensorOptName
+                    anchors.left: parent.left
+                    anchors.right: sensorOptVal.left
+                    anchors.rightMargin: Style.space(8)
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(6)
+
+                    Text {
+                      text: isSelected ? "✓" : (modelData.value === "auto" ? "🔥" : "󰍛")
+                      color: isSelected ? Color.accent : root.bar.foreground
+                      font.family: root.bar.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: isSelected
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: modelData.label
+                      color: root.bar.foreground
+                      font.family: root.bar.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: isSelected
+                      elide: Text.ElideRight
+                      width: parent.parent.width - Style.space(70)
+                    }
+                  }
+
+                  Text {
+                    id: sensorOptVal
+                    textFormat: Text.PlainText
+                    text: tempObj ? Model.formatTemp(tempObj.value) : "--"
+                    color: isSelected ? Color.accent : (tempObj && tempObj.value >= root.criticalTemp ? root.bar.urgent : Qt.darker(root.bar.foreground, 1.4))
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                  }
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    root.setFanCurve(fanRow.fan.id, fanRow.fan.curve || [], modelData.value)
+                    fanRow.sensorPickerOpen = false
+                  }
+                }
+              }
+            }
           }
         }
       }
@@ -1128,11 +1283,19 @@ Panel {
       anchors.rightMargin: Style.space(8)
       anchors.verticalCenter: parent.verticalCenter
 
+      readonly property real tempVal: Number(tempRow.temp.value)
+      readonly property color meterColor: {
+        if (!isFinite(tempVal)) return root.bar.foreground
+        if (tempVal >= root.criticalTemp) return root.bar.urgent
+        if (tempVal >= root.criticalTemp - 15) return Color.warning || "#e0af68"
+        return root.bar.foreground
+      }
+
       Rectangle {
         width: parent.width * Model.thermalFraction(tempRow.temp.value, root.criticalTemp)
         height: parent.height
         radius: parent.radius
-        color: tempRow.temp.value >= root.criticalTemp ? root.bar.urgent : root.bar.foreground
+        color: tempMeter.meterColor
       }
     }
 
@@ -1140,7 +1303,12 @@ Panel {
       id: tempValue
       textFormat: Text.PlainText
       text: Model.formatTemp(tempRow.temp.value)
-      color: tempRow.temp.value >= root.criticalTemp ? root.bar.urgent : root.bar.foreground
+      color: {
+        var v = Number(tempRow.temp.value)
+        if (isFinite(v) && v >= root.criticalTemp) return root.bar.urgent
+        if (isFinite(v) && v >= root.criticalTemp - 15) return Color.warning || "#e0af68"
+        return root.bar.foreground
+      }
       font.family: root.bar.fontFamily
       font.pixelSize: Style.font.bodySmall
       horizontalAlignment: Text.AlignRight
