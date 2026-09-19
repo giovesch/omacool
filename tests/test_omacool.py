@@ -282,6 +282,22 @@ class ConfigTests(FakeTreeCase):
         self.assertEqual(plan["curve"], omacool.normalize_curve(
             omacool.DEFAULT_CURVES["performance"]))
 
+    def test_fan_group_detection(self):
+        self.assertEqual(omacool.detect_fan_group({"label": "CPU fan", "chipName": "nct6798"}), "cpu")
+        self.assertEqual(omacool.detect_fan_group({"chipName": "amdgpu"}), "gpu")
+        self.assertEqual(omacool.detect_fan_group({"label": "AIO Pump"}), "pump")
+        self.assertEqual(omacool.detect_fan_group({"label": "Chassis Fan 1"}), "case")
+        self.assertEqual(omacool.detect_fan_group({"id": "nct6798/fan1", "chipName": "nct6798"}), "cpu")
+
+    def test_status_includes_groups_and_fan_groups(self):
+        status = omacool.build_status()
+        self.assertIn("groups", status)
+        gids = [g["id"] for g in status["groups"]]
+        for expected in ("cpu", "gpu", "case", "pump"):
+            self.assertIn(expected, gids)
+        fan_map = {f["id"]: f for f in status["fans"]}
+        self.assertEqual(fan_map["nct6798/fan1"]["group"], "cpu")
+
 
 class DaemonSocketTests(FakeTreeCase):
     def setUp(self):
@@ -383,6 +399,27 @@ class DaemonSocketTests(FakeTreeCase):
         self.assertTrue(status["ok"])
         self.assertEqual(status["controllable"], 2)
 
+    def test_daemon_add_and_remove_custom_group(self):
+        res = self.call({"cmd": "group-add", "name": "Front Intake"})
+        self.assertTrue(res["ok"])
+        gid = res["group"]["id"]
+        self.assertEqual(gid, "front-intake")
+
+        # Assign fan2 to custom group
+        res = self.call({"cmd": "group-set", "fan": "nct6798/fan2", "group": gid})
+        self.assertTrue(res["ok"])
+
+        status = self.call({"cmd": "status"})
+        fan_map = {f["id"]: f for f in status["fans"]}
+        self.assertEqual(fan_map["nct6798/fan2"]["group"], "front-intake")
+
+        # Remove custom group
+        res = self.call({"cmd": "group-remove", "group_id": gid})
+        self.assertTrue(res["ok"])
+        status = self.call({"cmd": "status"})
+        group_ids = [g["id"] for g in status["groups"]]
+        self.assertNotIn("front-intake", group_ids)
+
 
 class AuthorizationTests(FakeTreeCase):
     """The polkit gate, exercised with a stand-in pkcheck.
@@ -483,6 +520,15 @@ class CliTests(FakeTreeCase):
         result = self.run_cli("status")
         self.assertIn("nct6798/fan1", result.stdout)
         self.assertIn("CPU fan", result.stdout)
+        self.assertIn("[CPU]", result.stdout)
+        self.assertIn("[CASE]", result.stdout)
+
+    def test_group_cli_list_json(self):
+        result = self.run_cli("group", "list", "--json")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        data = json.loads(result.stdout)
+        self.assertIn("groups", data)
+        self.assertIn("fans", data)
 
     def test_preset_listing_marks_the_active_one(self):
         result = self.run_cli("preset")

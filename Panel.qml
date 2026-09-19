@@ -38,6 +38,9 @@ Panel {
   readonly property var temps: status && status.temps ? status.temps : []
   readonly property var fans: status && status.fans ? status.fans : []
   readonly property var presets: status && status.presets ? status.presets : []
+  readonly property var groups: status && status.groups ? status.groups : []
+  property bool addingGroup: false
+  property string newGroupName: ""
   readonly property var hottest: status && status.hottest ? status.hottest : null
   readonly property bool daemonRunning: status ? status.daemon === true : false
   readonly property string activePreset: status ? String(status.preset || "") : ""
@@ -269,6 +272,24 @@ Panel {
     if (!id) return
     clearDraftPercent(id)
     runControl(["reset", String(id)])
+  }
+
+  function setFanGroup(fanId, groupId) {
+    if (!fanId || !groupId) return
+    runControl(["group", "set", String(fanId), String(groupId)])
+  }
+
+  function addCustomGroup(name) {
+    var trimmed = String(name || "").trim()
+    if (!trimmed) return
+    runControl(["group", "add", trimmed])
+    root.addingGroup = false
+    root.newGroupName = ""
+  }
+
+  function removeCustomGroup(groupId) {
+    if (!groupId) return
+    runControl(["group", "remove", String(groupId)])
   }
 
   function nudgeFan(fan, delta) {
@@ -692,25 +713,236 @@ Panel {
 
           Column {
             width: parent.width
-            spacing: Style.space(6)
+            spacing: Style.space(8)
             visible: root.fans.length > 0
 
-            PanelSectionHeader {
-              text: "FANS"
-              foreground: root.bar.foreground
-              fontFamily: root.bar.fontFamily
+            Item {
+              width: parent.width
+              implicitHeight: Math.max(fanSectionHeader.implicitHeight, addGroupBtn.implicitHeight)
+
+              PanelSectionHeader {
+                id: fanSectionHeader
+                text: "FANS"
+                foreground: root.bar.foreground
+                fontFamily: root.bar.fontFamily
+                anchors.left: parent.left
+                anchors.verticalCenter: parent.verticalCenter
+              }
+
+              CursorSurface {
+                id: addGroupBtn
+                anchors.right: parent.right
+                anchors.verticalCenter: parent.verticalCenter
+                implicitHeight: Style.space(22)
+                implicitWidth: addGroupRow.implicitWidth + Style.spacing.md
+                foreground: root.bar.foreground
+                fill: Style.hoverFillFor(root.bar.foreground, Color.accent)
+                bordered: true
+                cursorShape: Qt.PointingHandCursor
+                visible: !root.addingGroup
+
+                Row {
+                  id: addGroupRow
+                  anchors.centerIn: parent
+                  spacing: Style.space(4)
+
+                  Text {
+                    text: "+"
+                    color: Color.accent
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                    font.bold: true
+                  }
+
+                  Text {
+                    textFormat: Text.PlainText
+                    text: "New Group"
+                    color: root.bar.foreground
+                    font.family: root.bar.fontFamily
+                    font.pixelSize: Style.font.caption
+                  }
+                }
+
+                MouseArea {
+                  anchors.fill: parent
+                  hoverEnabled: true
+                  cursorShape: Qt.PointingHandCursor
+                  onClicked: {
+                    root.addingGroup = true
+                    root.newGroupName = ""
+                  }
+                }
+              }
             }
 
-            Repeater {
-              model: root.fans
+            // Inline New Group Creator
+            Rectangle {
+              id: newGroupBox
+              width: parent.width
+              implicitHeight: Style.space(34)
+              visible: root.addingGroup
+              radius: Style.spacing.xs
+              color: Style.hoverFillFor(root.bar.foreground, Color.accent)
+              border.color: Color.accent
+              border.width: 1
 
-              FanRow {
+              Row {
+                anchors.fill: parent
+                anchors.margins: Style.space(4)
+                spacing: Style.spacing.xs
+
+                TextInput {
+                  id: newGroupInput
+                  width: parent.width - confirmGroupBtn.width - cancelGroupBtn.width - Style.spacing.sm * 2
+                  anchors.verticalCenter: parent.verticalCenter
+                  color: root.bar.foreground
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.caption
+                  text: root.newGroupName
+                  onTextChanged: root.newGroupName = text
+                  onAccepted: root.addCustomGroup(text)
+                }
+
+                Button {
+                  id: confirmGroupBtn
+                  text: "Add"
+                  fontSize: Style.font.caption
+                  foreground: root.bar.foreground
+                  fontFamily: root.bar.fontFamily
+                  anchors.verticalCenter: parent.verticalCenter
+                  horizontalPadding: Style.spacing.sm
+                  verticalPadding: Style.space(2)
+                  bordered: true
+                  onClicked: root.addCustomGroup(newGroupInput.text)
+                }
+
+                Button {
+                  id: cancelGroupBtn
+                  text: "Cancel"
+                  fontSize: Style.font.caption
+                  foreground: root.bar.foreground
+                  fontFamily: root.bar.fontFamily
+                  anchors.verticalCenter: parent.verticalCenter
+                  horizontalPadding: Style.spacing.sm
+                  verticalPadding: Style.space(2)
+                  bordered: true
+                  onClicked: {
+                    root.addingGroup = false
+                    root.newGroupName = ""
+                  }
+                }
+              }
+            }
+
+            // Grouped Fans List
+            Repeater {
+              id: groupRepeater
+              model: Model.organizeFansByGroup(root.fans, root.groups)
+
+              Column {
+                id: groupColumn
                 required property var modelData
                 required property int index
 
                 width: panelColumn.width
-                fan: modelData
-                rowIndex: index
+                spacing: Style.space(4)
+
+                // Group Header
+                Item {
+                  width: parent.width
+                  implicitHeight: Math.max(groupHeaderTitle.implicitHeight, groupDeleteBtn.implicitHeight)
+
+                  Row {
+                    id: groupHeaderTitle
+                    anchors.left: parent.left
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: Style.space(6)
+
+                    Text {
+                      text: modelData.icon
+                      color: Color.accent
+                      font.family: root.bar.fontFamily
+                      font.pixelSize: Style.font.bodySmall
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: modelData.name.toUpperCase()
+                      color: Qt.darker(root.bar.foreground, 1.25)
+                      font.family: root.bar.fontFamily
+                      font.pixelSize: Style.font.caption
+                      font.bold: true
+                      font.letterSpacing: 1.1
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+
+                    Text {
+                      textFormat: Text.PlainText
+                      text: "· " + modelData.fans.length + (modelData.fans.length === 1 ? " fan" : " fans")
+                      color: Qt.darker(root.bar.foreground, 1.6)
+                      font.family: root.bar.fontFamily
+                      font.pixelSize: Style.font.caption
+                      anchors.verticalCenter: parent.verticalCenter
+                    }
+                  }
+
+                  // Delete button for custom groups
+                  CursorSurface {
+                    id: groupDeleteBtn
+                    anchors.right: parent.right
+                    anchors.verticalCenter: parent.verticalCenter
+                    visible: !modelData.builtin
+                    implicitHeight: Style.space(20)
+                    implicitWidth: Style.space(20)
+                    foreground: root.bar.foreground
+                    fill: Style.hoverFillFor(root.bar.foreground, Color.accent)
+                    cursorShape: Qt.PointingHandCursor
+
+                    Text {
+                      anchors.centerIn: parent
+                      text: "×"
+                      color: root.bar.urgent
+                      font.family: root.bar.fontFamily
+                      font.pixelSize: Style.font.body
+                      font.bold: true
+                    }
+
+                    MouseArea {
+                      anchors.fill: parent
+                      hoverEnabled: true
+                      cursorShape: Qt.PointingHandCursor
+                      onClicked: root.removeCustomGroup(groupColumn.modelData.id)
+                    }
+                  }
+                }
+
+                // Empty notice for custom groups with 0 fans
+                Text {
+                  width: parent.width
+                  visible: modelData.fans.length === 0
+                  textFormat: Text.PlainText
+                  text: "No fans in this group. Expand a fan below to assign it here."
+                  color: Qt.darker(root.bar.foreground, 1.6)
+                  font.family: root.bar.fontFamily
+                  font.pixelSize: Style.font.caption
+                  font.italic: true
+                  leftPadding: Style.space(12)
+                }
+
+                // Fans in this group
+                Repeater {
+                  model: modelData.fans
+
+                  FanRow {
+                    required property var modelData
+                    required property int index
+
+                    width: panelColumn.width
+                    fan: modelData
+                    rowIndex: Model.findFanIndex(root.fans, modelData.id)
+                  }
+                }
               }
             }
           }
@@ -969,6 +1201,43 @@ Panel {
           modeLabel: "Reset"
           width: modeRow.cellWidth
           tooltipText: "Drop this fan's override and follow the preset again"
+        }
+      }
+
+      // Group switcher
+      Column {
+        width: parent.width - parent.leftPadding
+        spacing: Style.space(4)
+
+        PanelSectionHeader {
+          text: "GROUP"
+          foreground: root.bar.foreground
+          fontFamily: root.bar.fontFamily
+        }
+
+        Flow {
+          width: parent.width
+          spacing: Style.spacing.xs
+
+          Repeater {
+            model: Model.allGroupOptions(root.groups)
+
+            Button {
+              id: groupPill
+              required property var modelData
+
+              text: modelData.name
+              fontSize: Style.font.caption
+              foreground: root.bar.foreground
+              fontFamily: root.bar.fontFamily
+              horizontalPadding: Style.spacing.sm
+              verticalPadding: Style.spacing.controlPaddingY
+              bordered: true
+              selected: (fanRow.fan.group || Model.detectFanGroup(fanRow.fan)) === modelData.id
+
+              onClicked: root.setFanGroup(fanRow.fan.id, modelData.id)
+            }
+          }
         }
       }
 

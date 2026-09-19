@@ -65,6 +65,13 @@ DEFAULT_CURVES = {
     "performance": [[30, 35], [45, 50], [58, 70], [70, 90], [80, 100]],
 }
 
+BUILTIN_GROUPS = [
+    {"id": "cpu", "name": "CPU", "builtin": True},
+    {"id": "gpu", "name": "GPU", "builtin": True},
+    {"id": "case", "name": "Case", "builtin": True},
+    {"id": "pump", "name": "Pump", "builtin": True},
+]
+
 DEFAULT_CONFIG = {
     "version": 1,
     "preset": "balanced",
@@ -90,6 +97,8 @@ DEFAULT_CONFIG = {
     },
     # Per-fan overrides, keyed by fan id. Anything absent follows the preset.
     "fans": {},
+    "custom_groups": [],
+    "fan_groups": {},
 }
 
 
@@ -360,6 +369,10 @@ def load_config(path=CONFIG_PATH):
             config["presets"] = presets
     if not isinstance(config.get("fans"), dict):
         config["fans"] = {}
+    if not isinstance(config.get("custom_groups"), list):
+        config["custom_groups"] = []
+    if not isinstance(config.get("fan_groups"), dict):
+        config["fan_groups"] = {}
     return config
 
 
@@ -524,8 +537,37 @@ class Controller:
 
 
 # --------------------------------------------------------------------------
-# status
+# status and fan grouping
 # --------------------------------------------------------------------------
+
+def detect_fan_group(fan):
+    """Infer whether a fan belongs to cpu, gpu, pump, or case."""
+    label = (fan.get("label") or "").lower()
+    chip = (fan.get("chip") or "").lower()
+    chip_name = (fan.get("chipName") or "").lower()
+    fan_id = (fan.get("id") or "").lower()
+    combined = " ".join([label, chip, chip_name, fan_id])
+
+    # 1. GPU
+    if any(k in combined for k in ("amdgpu", "nouveau", "nvidia", "radeon", "video", "gpu")):
+        return "gpu"
+
+    # 2. Water Pump / AIO
+    if any(k in combined for k in ("pump", "aio", "water")):
+        return "pump"
+
+    # 3. CPU
+    if any(k in combined for k in ("cpu", "processor", "cooler", "coretemp", "k10temp", "zenpower")):
+        return "cpu"
+
+    # 4. SuperIO fan1 often defaults to CPU if unlabelled
+    match = re.search(r"fan1$", fan_id)
+    if match and any(s in chip_name for s in ("nct", "it87", "w83", "f71", "aspeed")):
+        return "cpu"
+
+    # 5. Case / Chassis / General
+    return "case"
+
 
 def build_status(config=None, daemon_running=None):
     config = config or load_config()
@@ -534,6 +576,13 @@ def build_status(config=None, daemon_running=None):
     fans = flat_fans(chips)
     top = hottest(temps)
 
+    all_groups = [dict(g) for g in BUILTIN_GROUPS]
+    custom = config.get("custom_groups") or []
+    for cg in custom:
+        if cg.get("id") and not any(g["id"] == cg["id"] for g in all_groups):
+            all_groups.append({"id": cg["id"], "name": cg.get("name") or cg["id"], "builtin": False})
+
+    fan_groups = config.get("fan_groups") or {}
     for fan in fans:
         plan = fan_plan(config, fan["id"])
         fan["mode"] = plan["mode"] if fan["writable"] else "readonly"
@@ -541,6 +590,7 @@ def build_status(config=None, daemon_running=None):
         fan["sensor"] = plan["sensor"]
         fan["target"] = plan["percent"]
         fan["pinned"] = fan["id"] in (config.get("fans") or {})
+        fan["group"] = fan_groups.get(fan["id"]) or (config.get("fans") or {}).get(fan["id"], {}).get("group") or detect_fan_group(fan)
         for key in ("pwmPath", "enablePath", "tachoPath"):
             fan.pop(key, None)
     for temp in temps:
@@ -570,6 +620,7 @@ def build_status(config=None, daemon_running=None):
         "hottest": top,
         "temps": temps,
         "fans": fans,
+        "groups": all_groups,
         "presets": presets,
         "controllable": sum(1 for fan in fans if fan["writable"]),
     }
@@ -756,6 +807,50 @@ class Daemon:
         self.controller.apply_once(force=True)
         return {"ok": True, "fan": fan_id}
 
+    def set_fan_group(self, fan_id, group_id):
+        if not fan_id:
+            return {"ok": False, "error": "fan id required"}
+        group_id = str(group_id or "").strip().lower()
+        if not group_id:
+            return {"ok": False, "error": "group id required"}
+        fan_groups = self.config.setdefault("fan_groups", {})
+        fan_groups[fan_id] = group_id
+        self._persist()
+        return {"ok": True, "fan": fan_id, "group": group_id}
+
+    def add_group(self, name, group_id=None):
+        name = str(name or "").strip()
+        if not name:
+            return {"ok": False, "error": "group name cannot be empty"}
+        gid = str(group_id or "").strip().lower()
+        if not gid:
+            gid = re.sub(r"[^a-z0-9_-]", "-", name.lower()).strip("-")
+        if not gid:
+            gid = "group_%d" % int(time.time())
+        custom = self.config.setdefault("custom_groups", [])
+        for entry in custom:
+            if entry.get("id") == gid:
+                entry["name"] = name
+                self._persist()
+                return {"ok": True, "group": entry}
+        entry = {"id": gid, "name": name, "builtin": False}
+        custom.append(entry)
+        self._persist()
+        return {"ok": True, "group": entry}
+
+    def remove_group(self, group_id):
+        gid = str(group_id or "").strip().lower()
+        if not gid:
+            return {"ok": False, "error": "group id required"}
+        custom = self.config.setdefault("custom_groups", [])
+        self.config["custom_groups"] = [g for g in custom if g.get("id") != gid]
+        fan_groups = self.config.setdefault("fan_groups", {})
+        to_del = [f for f, g in fan_groups.items() if g == gid]
+        for f in to_del:
+            del fan_groups[f]
+        self._persist()
+        return {"ok": True, "group": gid}
+
     # -- request dispatch ---------------------------------------------------
 
     def dispatch(self, request, connection):
@@ -801,6 +896,12 @@ class Daemon:
                 return self.set_preset_curve(str(request.get("name") or ""), request.get("curve") or [])
             if command == "reset":
                 return self.reset_fan(str(request.get("fan") or ""))
+            if command == "group-set":
+                return self.set_fan_group(request.get("fan"), request.get("group"))
+            if command == "group-add":
+                return self.add_group(request.get("name"), request.get("group_id"))
+            if command == "group-remove":
+                return self.remove_group(request.get("group_id") or request.get("group"))
             if command == "reload":
                 self.config = load_config(self.config_path)
                 self.controller.config = self.config
@@ -959,11 +1060,72 @@ def cmd_status(args):
         print("  %-28s %6.1f°C  %s" % (temp["id"], temp["value"], temp["label"]))
     print()
     print("FANS")
+    by_group = {}
     for fan in status["fans"]:
-        rpm = "%5d rpm" % fan["rpm"] if fan["rpm"] is not None else "   no tacho"
-        percent = "%3d%%" % fan["percent"] if fan["percent"] is not None else "  --"
-        flag = "" if fan["writable"] else "  (read-only)"
-        print("  %-28s %s  %s  %-7s %s%s" % (fan["id"], rpm, percent, fan["mode"], fan["label"], flag))
+        gid = fan.get("group") or "case"
+        by_group.setdefault(gid, []).append(fan)
+
+    group_names = {g["id"]: g["name"] for g in status.get("groups", [])}
+    for grp in status.get("groups", []):
+        gid = grp["id"]
+        gfans = by_group.get(gid, [])
+        if not gfans and grp.get("builtin"):
+            continue
+        gname = grp.get("name") or gid.upper()
+        custom_tag = " (custom)" if not grp.get("builtin") else ""
+        print("  [%s%s]" % (gname.upper(), custom_tag))
+        if not gfans:
+            print("    (no fans assigned)")
+        for fan in gfans:
+            rpm = "%5d rpm" % fan["rpm"] if fan["rpm"] is not None else "   no tacho"
+            percent = "%3d%%" % fan["percent"] if fan["percent"] is not None else "  --"
+            flag = "" if fan["writable"] else "  (read-only)"
+            print("    %-28s %s  %s  %-7s %s%s" % (fan["id"], rpm, percent, fan["mode"], fan["label"], flag))
+    return 0
+
+
+def cmd_group_list(args):
+    status = build_status()
+    if getattr(args, "json", False):
+        print_json({"groups": status.get("groups", []), "fans": status.get("fans", [])})
+        return 0
+
+    by_group = {}
+    for fan in status["fans"]:
+        gid = fan.get("group") or "case"
+        by_group.setdefault(gid, []).append(fan)
+
+    for grp in status.get("groups", []):
+        gid = grp["id"]
+        fans = by_group.get(gid, [])
+        builtin_tag = " (builtin)" if grp.get("builtin") else " (custom)"
+        print("%s [%s]%s: %d fan(s)" % (grp["name"], gid, builtin_tag, len(fans)))
+        for fan in fans:
+            print("  - %-28s %s" % (fan["id"], fan.get("label", "")))
+    return 0
+
+
+def cmd_group_add(args):
+    result = control({"cmd": "group-add", "name": args.name, "group_id": args.group_id})
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_group_remove(args):
+    result = control({"cmd": "group-remove", "group_id": args.group})
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_group_set(args):
+    result = control({"cmd": "group-set", "fan": args.fan, "group": args.group})
+    print_json(result)
+    return 0 if result.get("ok") else 1
+
+
+def cmd_group(args):
+    if not getattr(args, "group_cmd", None):
+        return cmd_group_list(args)
     return 0
 
 
@@ -1071,6 +1233,28 @@ def build_parser():
     reset = sub.add_parser("reset", help="drop a fan's override and follow the preset again")
     reset.add_argument("fan")
     reset.set_defaults(func=cmd_reset)
+
+    grp = sub.add_parser("group", help="manage fan groups (cpu, gpu, case, or custom)")
+    grp_sub = grp.add_subparsers(dest="group_cmd")
+    grp.set_defaults(func=cmd_group)
+
+    grp_list = grp_sub.add_parser("list", help="list fan groups and assignments")
+    grp_list.add_argument("--json", action="store_true")
+    grp_list.set_defaults(func=cmd_group_list)
+
+    grp_add = grp_sub.add_parser("add", help="create a custom fan group")
+    grp_add.add_argument("name", help="display name of the group")
+    grp_add.add_argument("--id", dest="group_id", help="optional group identifier")
+    grp_add.set_defaults(func=cmd_group_add)
+
+    grp_rm = grp_sub.add_parser("remove", help="remove a custom fan group")
+    grp_rm.add_argument("group", help="group identifier to remove")
+    grp_rm.set_defaults(func=cmd_group_remove)
+
+    grp_set = grp_sub.add_parser("set", help="assign a fan to a group")
+    grp_set.add_argument("fan", help="fan identifier (chip/fanX)")
+    grp_set.add_argument("group", help="group identifier (cpu, gpu, case, pump, or custom id)")
+    grp_set.set_defaults(func=cmd_group_set)
 
     daemon = sub.add_parser("daemon", help="run the control loop (root, normally via systemd)")
     daemon.add_argument("--config", default=CONFIG_PATH)

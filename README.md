@@ -132,6 +132,10 @@ omacool mode nct6798/fan2 auto # hand it back to the firmware
 omacool curve nct6798/fan1 40:20,60:50,80:100
 omacool curve nct6798/fan1 --show
 omacool reset nct6798/fan1     # follow the preset again
+omacool group list             # list groups and fan assignments
+omacool group add "Front Fans" # create a custom group
+omacool group set nct6798/fan2 front-fans # assign a fan to a group
+omacool group remove front-fans # delete a custom group
 ```
 
 Fan ids are `<chip>/<channel>` and are stable across reboots — they are built

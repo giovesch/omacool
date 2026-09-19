@@ -164,3 +164,112 @@ function presetOptions(presets) {
   }
   return options
 }
+
+function groupIcon(groupId) {
+  switch (groupId) {
+    case "cpu": return "󰻠"
+    case "gpu": return "󰢮"
+    case "pump": return "󰅟"
+    case "case": return "󰒋"
+    default: return "󰚢"
+  }
+}
+
+function detectFanGroup(fan) {
+  if (fan && fan.group) return fan.group
+  var label = String((fan && fan.label) || "").toLowerCase()
+  var chip = String((fan && (fan.chipName || fan.chip)) || "").toLowerCase()
+  var id = String((fan && fan.id) || "").toLowerCase()
+  var combined = label + " " + chip + " " + id
+
+  if (/amdgpu|nouveau|nvidia|radeon|video|gpu/.test(combined)) return "gpu"
+  if (/pump|aio|water/.test(combined)) return "pump"
+  if (/cpu|processor|cooler|coretemp|k10temp|zenpower/.test(combined)) return "cpu"
+  if (/fan1$/.test(id) && /nct|it87|w83/.test(chip)) return "cpu"
+  return "case"
+}
+
+function organizeFansByGroup(fans, groups) {
+  var groupMap = {}
+  var groupList = []
+
+  var defaultGroups = [
+    { id: "cpu", name: "CPU", builtin: true },
+    { id: "gpu", name: "GPU", builtin: true },
+    { id: "case", name: "Case", builtin: true },
+    { id: "pump", name: "Pump", builtin: true }
+  ]
+
+  var allGroups = (groups && groups.length) ? groups.slice() : defaultGroups
+  for (var d = 0; d < defaultGroups.length; d++) {
+    var found = false
+    for (var g = 0; g < allGroups.length; g++) {
+      if (allGroups[g].id === defaultGroups[d].id) { found = true; break }
+    }
+    if (!found) allGroups.push(defaultGroups[d])
+  }
+
+  for (var i = 0; i < allGroups.length; i++) {
+    var grp = allGroups[i]
+    var item = {
+      id: grp.id,
+      name: grp.name || grp.id,
+      builtin: grp.builtin !== false,
+      icon: groupIcon(grp.id),
+      fans: []
+    }
+    groupMap[grp.id] = item
+    groupList.push(item)
+  }
+
+  for (var j = 0; j < (fans || []).length; j++) {
+    var fan = fans[j]
+    var gid = fan.group || detectFanGroup(fan)
+    if (!groupMap[gid]) {
+      var newGrp = {
+        id: gid,
+        name: gid.charAt(0).toUpperCase() + gid.slice(1),
+        builtin: false,
+        icon: groupIcon(gid),
+        fans: []
+      }
+      groupMap[gid] = newGrp
+      groupList.push(newGrp)
+    }
+    groupMap[gid].fans.push(fan)
+  }
+
+  var active = []
+  for (var k = 0; k < groupList.length; k++) {
+    var entry = groupList[k]
+    if (entry.fans.length > 0 || !entry.builtin) {
+      active.push(entry)
+    }
+  }
+  return active
+}
+
+function allGroupOptions(groups) {
+  var defaultGroups = [
+    { id: "cpu", name: "CPU", builtin: true },
+    { id: "gpu", name: "GPU", builtin: true },
+    { id: "case", name: "Case", builtin: true },
+    { id: "pump", name: "Pump", builtin: true }
+  ]
+  var all = (groups && groups.length) ? groups.slice() : defaultGroups
+  for (var d = 0; d < defaultGroups.length; d++) {
+    var found = false
+    for (var g = 0; g < all.length; g++) {
+      if (all[g].id === defaultGroups[d].id) { found = true; break }
+    }
+    if (!found) all.push(defaultGroups[d])
+  }
+  return all
+}
+
+function findFanIndex(fans, id) {
+  for (var i = 0; i < (fans || []).length; i++) {
+    if (fans[i] && fans[i].id === id) return i
+  }
+  return -1
+}
