@@ -1196,7 +1196,7 @@ def cmd_daemon(args):
 
 def build_parser():
     parser = argparse.ArgumentParser(prog="omacool", description="hwmon fan control for Omarchy")
-    parser.add_argument("--version", action="version", version="omacool 1.0.0")
+    parser.add_argument("--version", action="version", version="omacool 1.1.0")
     sub = parser.add_subparsers(dest="command")
 
     status = sub.add_parser("status", help="temperatures, fan speeds and the active preset")

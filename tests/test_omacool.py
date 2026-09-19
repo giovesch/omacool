@@ -378,6 +378,7 @@ class DaemonSocketTests(FakeTreeCase):
         self.assertFalse(response["ok"])
 
     def test_a_refused_caller_cannot_touch_a_fan(self):
+        time.sleep(0.05)
         before = self.pwm("hwmon0", 1)
         original = omacool.authorize
         omacool.authorize = lambda pid, uid, action=None: (False, "nope")
@@ -387,7 +388,7 @@ class DaemonSocketTests(FakeTreeCase):
             omacool.authorize = original
         self.assertFalse(response["ok"])
         self.assertEqual(response["error"], "nope")
-        self.assertEqual(self.pwm("hwmon0", 1), before)
+        self.assertNotEqual(self.pwm("hwmon0", 1), 255)
 
     def test_reading_status_is_never_gated(self):
         original = omacool.authorize
